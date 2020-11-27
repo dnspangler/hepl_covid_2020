@@ -1,0 +1,197 @@
+---
+title: "Appendix 1 - The Swedish Covid-19 Strategy: A Comparison of the National Policy Response between the First and Second Waves"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message = FALSE,warning = FALSE)
+```
+
+This notebook reports the sources and transformations used to generate the descriptive data reported in the study "The Swedish Covid-19 Strategy: A Comparison of the National Policy Response between the First and Second Waves". The source code and raw data are available at https://github.com/dnspangler/hepl_covid_2020
+
+# Load and transform data
+
+```{r load}
+
+library(readxl)
+library(tidyverse)
+
+options(scipen = 999)
+
+# Load national Covid-19 tracking data from:
+# https://www.folkhalsomyndigheten.se/smittskydd-beredskap/utbrott/aktuella-utbrott/covid-19/statistik-och-analyser/bekraftade-fall-i-sverige/
+
+# Specifically:
+# https://www.arcgis.com/sharing/rest/content/items/b5e7488e117749c19881cce45db13f7e/data
+
+fhm <- read_excel("Folkhalsomyndigheten_Covid19.xlsx", 
+                                           sheet = "Veckodata Region") %>%
+  mutate(date = as.Date(paste(2020, veckonummer, 1, sep="-"), "%Y-%U-%u"))
+
+
+# Load testing data from PHA - This is for some reason not included in the main dataset, and had to be manually compiled from:
+# https://www.folkhalsomyndigheten.se/smittskydd-beredskap/utbrott/aktuella-utbrott/covid-19/statistik-och-analyser/antalet-testade-for-covid-19/
+# https://www.folkhalsomyndigheten.se/smittskydd-beredskap/utbrott/aktuella-utbrott/covid-19/statistik-och-analyser/antalet-testade-for-covid-19/tidigare-data/
+
+fhm_test <- read_excel("fhm_Covid19_tester.xlsx")
+
+
+# Load data from Statistics Sweden on mortality rates from 2015 - 2020
+#https://www.scb.se/hitta-statistik/statistik-efter-amne/befolkning/befolkningens-sammansattning/befolkningsstatistik/pong/tabell-och-diagram/preliminar-statistik-over-doda/
+
+scb <- read_excel("preliminar_statistik_over_doda_inkl_eng.xlsx", 
+                  sheet = "Tabell 6",skip = 11) %>%
+  mutate(veckonummer = as.numeric(Vecka))
+
+# Load data from NBHW from nbhw - Unfortunately looks like this isn't getting updated anymore!
+#https://www.socialstyrelsen.se/globalassets/1-globalt/covid-19-statistik/statistik-relaterad-till-covid-19/dodlighet-aldre-med-sarskilt-boende-eller-hemtjanst.xlsx
+
+nbhw <- read_excel("dodlighet-aldre-med-sarskilt-boende-eller-hemtjanst.xlsx", 
+                  sheet = "Jämf genomsnitt, antal",
+                  skip = 3) %>%
+  filter(!is.na(`Särskilt boende (2020)`)) %>%
+  mutate(excess_nh = `Särskilt boende (2020)`- `Särskilt boende (genomsnitt 2016-2019)`,
+         excess_hc = `Hemtjänst (2020)`- `Hemtjänst (genomsnitt 2016-2019)`,
+         excess_no_nh_hc = `Ej särskilt boende eller hemtjänst (2020)` - `Ej särskilt boende eller hemtjänst (genomsnitt 2016-2019)`,
+         excess_over_70 = excess_nh+excess_hc+excess_no_nh_hc,
+         tot_over70 = `Särskilt boende (2020)`+`Hemtjänst (2020)`+`Ej särskilt boende eller hemtjänst (2020)`,
+         veckonummer = as.numeric(Vecka),
+         date = as.Date(paste(2020, veckonummer, 1, sep="-"), "%Y-%U-%u"))
+
+# Combine scb and nbhw data to calculate mortality under 70
+excess_mort = select(scb,veckonummer,excess_all = `Överdödl. Riket`,tot = `Tot 2020`) %>%
+  left_join(select(nbhw,veckonummer,date,starts_with("excess_"),tot_over70), by = "veckonummer") %>%
+  mutate(excess_under_70 = excess_all - excess_over_70) %>%
+  filter(veckonummer > 1) # Looks like scb only counts part of the first week of the year, So not comparable
+
+# aggregate data at national level
+
+agg <- fhm %>%
+  group_by(veckonummer) %>%
+  summarize(across(where(is.numeric),sum)) %>%
+  ungroup() %>%
+  left_join(fhm_test, by = "veckonummer") %>%
+  left_join(select(scb,veckonummer, `Medelvärde 2015-2019`,`Tot 2020`,`Överdödl. Riket`),
+            by = "veckonummer") %>%
+  mutate(date = as.Date(paste(2020, veckonummer, 1, sep="-"), "%Y-%U-%u"),
+         test_pos_rate = Antal_fall_vecka/Antal_pcr*100,
+         case_fatality_rate = Antal_avlidna_vecka/Antal_fall_vecka*100)
+
+# Dataset grouped by region
+
+fhm_reg_sum <- fhm %>%
+  group_by(Region) %>%
+  summarise(tot = sum(Antal_fall_vecka),
+            pop = round(sum(Antal_fall_vecka)/sum(Antal_fall_100000inv_vecka)*100000)) %>%
+  arrange(desc(tot)) %>%
+  mutate(agg_name = ifelse(tot > 3000,Region,"Other"),
+         agg_name = factor(agg_name,levels = rev(unique(agg_name))))
+
+```
+
+## Figure 1
+
+```{r fig1,fig.width=4,fig.height=8}
+# FHM stats aggregated
+agg_plot <- agg %>%
+  select(date,
+         "Covid-19 PCR tests performed" = Antal_pcr,
+         "New Covid-19 cases" = Antal_fall_vecka,
+         "New Covid-19 cases in ICU" = Antal_intensivvårdade_vecka,
+         "Covid-19-related Mortalities" = Antal_avlidna_vecka,
+         "Excess mortality (2020 v 2015-2019)" = `Överdödl. Riket`,
+         "Test positivity rate (%)" = test_pos_rate,
+         "Case fatality rate (%)" = case_fatality_rate) %>%
+  gather("measure","value",-date) %>%
+  # remove last week of mortality data - The second to last week of data also 
+  # tends to under-report by a smaller amount, but not enough to significantly 
+  # skew the interpretation.
+  filter(!(measure %in% c("Covid-19-related Mortalities",
+                          "Excess mortality (2020 v 2015-2019)",
+                          "Case fatality rate (%)") & 
+             date==max(date))) %>% 
+  mutate(measure = factor(measure,levels = unique(measure))) %>%
+  ggplot(aes(x=date,y = value)) +
+  theme_minimal() +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  theme(panel.grid.minor.x = element_blank()) +
+  geom_hline(yintercept = 0,color = "grey") +
+  geom_line(size = 1) +
+  #scale_y_continuous(breaks = seq(-200,800,200)) +
+  facet_wrap(~ measure,scales = "free_y",ncol = 1)
+
+
+# Use this to export a nice high-res .tif file
+# tiff("agg_plot.tif", res=300,height = 8,width = 4,units = "in")
+# agg_plot
+# dev.off()
+
+agg_plot
+
+```
+
+## Additional figures
+
+Due to space constraints, we had to cut some interesting stuff. Here are a couple of plots which didn't make it into the final paper:
+
+### Per capita cases and fatalities per region
+```{r reg_plot,fig.width=4,fig.height=8}
+
+reg_plot <- fhm %>% 
+  left_join(fhm_reg_sum, by = "Region") %>%
+  arrange(desc(pop)) %>%
+  mutate(Region = factor(Region,levels = unique(Region)),
+         Antal_avliden_1000000inv_vecka = Antal_avlidna_vecka/(pop/1000000)) %>%
+  select(date,
+         Region,
+         "Cases per 100k" = Antal_fall_100000inv_vecka,
+         "Deaths per million" = Antal_avliden_1000000inv_vecka) %>%
+  gather("measure","value",-date,-Region) %>%
+  mutate(measure = factor(measure,levels = rev(unique(measure)))) %>%
+  ggplot(aes(x=date,y=value,color=measure)) + 
+  geom_smooth(se=F,span = 0.2,size = 1) +
+  geom_point(size=0.1) +
+  theme_minimal() +
+  labs(color = "Covid related...") +
+  scale_y_continuous(breaks = c(0,100,200)) +
+  scale_x_date(date_breaks = "2 months",
+               date_minor_breaks = "1 month", 
+               date_labels = "%b") +
+  theme(panel.grid.minor.y = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        legend.position = c(0.75, 0.01)) +
+  facet_wrap(Region ~ .,ncol = 2,)
+
+reg_plot
+```
+
+### Excess mortality by age and form of social services
+
+```{r}
+
+excess_mort %>%
+  filter(!is.na(excess_nh)) %>%
+  arrange(desc(veckonummer)) %>%
+  mutate(date = as.Date(paste(2020, veckonummer, 1, sep="-"), "%Y-%U-%u")) %>%
+  select(date,
+         "70+ in nursing home" = excess_nh,
+         "70+ with home care" = excess_hc,
+         "70+ with no social services" =excess_no_nh_hc,
+         "<70 years old"=excess_under_70) %>%
+  gather("measure","value",-date) %>%
+  mutate(measure = factor(measure,levels = unique(measure))) %>%
+  ggplot(aes(x=date,y=value,fill=measure)) +
+    scale_y_continuous(breaks = seq(-200,800,100)) +
+    scale_x_date(date_breaks = "2 months",
+                 date_minor_breaks = "1 month", 
+                 date_labels = "%b") +
+    scale_fill_brewer(palette = "Set2") +
+    #scale_color_brewer(palette = "Set2") +
+    labs(y = "Excess mortality per week vs. 2015-2019",
+         fill = "Population cohort") +
+    geom_bar(stat = "identity",width = 7)
+```
+
